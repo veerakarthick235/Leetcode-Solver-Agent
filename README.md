@@ -36,22 +36,6 @@ The agent performs a continuous state-machine loop without human intervention:
 
 ---
 
-## 🏗️ System Architecture
-
-```mermaid
-graph TD
-    A[Chrome Browser (LeetCode Tab)] <-->|DevTools Protocol :9222| B(Browser Controller)
-    B -->|Extract Context| C{Agent Core}
-    C -->|Prompt Engineering| D[LLM Router]
-    D -->|API Call| E[Bytez API / Llama 3.1]
-    E -->|Generated Code| C
-    C -->|JS Injection| B
-    B -->|Click 'Run' & 'Submit'| A
-    C -->|Log Result| F[Memory / Logs]
-```
-
----
-
 ## 🧪 Tech Stack
 
 | Layer | Technology | Description |
