@@ -1,265 +1,110 @@
-"""Perception/Action layer for LeetCode Auto-Solver using Selenium"""
-
+import json
 import time
-import logging
-from typing import Dict, Optional
+import re
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import (
-    TimeoutException,
-    NoSuchElementException,
-    ElementNotInteractableException,
-    StaleElementReferenceException
-)
 
-from config import SELECTORS, TIMEOUTS, POLLING_INTERVALS
+class Browser:
+    def __init__(self):
+        opts = Options()
+        opts.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+        self.driver = webdriver.Chrome(options=opts)
 
-logger = logging.getLogger(__name__)
-
-
-class LeetCodeBrowser:
-    """Selenium-based browser automation for LeetCode UI"""
-    
-    def __init__(self, debugger_url: str):
-        """Connect to existing Chrome instance via DevTools Protocol
-        
-        Args:
-            debugger_url: Chrome DevTools endpoint (e.g., '127.0.0.1:9222')
-        """
-        self.driver = self._connect_to_chrome(debugger_url)
-        logger.info(f"Connected to Chrome at {debugger_url}")
-    
-    def _connect_to_chrome(self, debugger_url: str) -> webdriver.Chrome:
-        """Connect to existing Chrome instance
-        
-        Args:
-            debugger_url: DevTools endpoint
-        
-        Returns:
-            webdriver.Chrome: Connected driver instance
-        """
-        options = Options()
-        options.add_experimental_option("debuggerAddress", debugger_url)
-        driver = webdriver.Chrome(options=options)
-        return driver
-    
-    def scrape_problem_description(self, problem_url: str) -> str:
-        """Extract problem description from LeetCode problem page
-        
-        Args:
-            problem_url: Full LeetCode problem URL
-        
-        Returns:
-            str: Raw problem description text
-        
-        Raises:
-            TimeoutException: If description not found
-        """
-        logger.info(f"Navigating to {problem_url}")
-        self.driver.get(problem_url)
-        
+    def get_current_slug(self):
+        """Extracts the problem name from the URL"""
         try:
-            # Wait for page load
-            wait = WebDriverWait(self.driver, TIMEOUTS["page_load"])
-            
-            # Try multiple selectors for problem description
-            selectors = SELECTORS["problem_description"].split(", ")
-            description_element = None
-            
-            for selector in selectors:
-                try:
-                    description_element = wait.until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, selector.strip()))
-                    )
-                    if description_element:
-                        break
-                except TimeoutException:
-                    continue
-            
-            if not description_element:
-                raise TimeoutException("Could not find problem description")
-            
-            description = description_element.text
-            logger.info(f"Scraped description ({len(description)} chars)")
-            return description
-            
-        except Exception as e:
-            logger.error(f"Error scraping description: {e}")
-            raise
-    
-    def inject_code(self, code: str) -> bool:
-        """Inject Python code into Monaco editor
-        
-        Args:
-            code: Python solution code (no markdown formatting)
-        
-        Returns:
-            bool: True if injection successful
+            return self.driver.current_url.split("/problems/")[-1].split("/")[0]
+        except:
+            return "unknown-problem"
+
+    def optimize_tokens(self, text):
         """
+        TOKEN OPTIMIZER: Strips unnecessary HTML and whitespace 
+        to maximize Gemini quota efficiency.
+        """
+        if not text: return ""
+        # Remove all HTML tags
+        clean_text = re.sub(r'<[^>]*>', '', text)
+        # Collapse multiple newlines/spaces into single spaces
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        return clean_text
+
+    def get_text(self):
+        """Scrapes and optimizes the problem description"""
         try:
-            logger.info("Injecting code into editor...")
-            
-            # Wait for editor to be ready
-            wait = WebDriverWait(self.driver, TIMEOUTS["editor_ready"])
-            
-            # Try to find Monaco editor or textarea
-            editor = None
+            raw_text = self.driver.find_element(By.CSS_SELECTOR, "div[data-track-load='description_content']").text
+            return self.optimize_tokens(raw_text)
+        except:
             try:
-                editor = wait.until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, SELECTORS["monaco_editor"]))
-                )
-            except TimeoutException:
-                # Fallback to textarea
-                editor = wait.until(
-                    EC.presence_of_element_located((By.TAG_NAME, "textarea"))
-                )
+                raw_text = self.driver.find_element(By.TAG_NAME, "body").text
+                return self.optimize_tokens(raw_text)
+            except:
+                return ""
+
+    def get_starter_code(self):
+        """Scrapes the default code signature from the Monaco editor"""
+        try:
+            return self.driver.execute_script("return monaco.editor.getModels()[0].getValue();")
+        except:
+            return ""
+
+    def run_code(self, code):
+        """Injects code safely using Force-Click and Banner-Removal logic"""
+        try:
+            # 1. Pop-up & Banner Killer: Clears UI elements that intercept clicks
+            self.driver.execute_script("""
+                var blockers = document.querySelectorAll('.lc-md\\\\:h-8, [class*="overlay"], [class*="tooltip"], .guide-container');
+                blockers.forEach(el => el.remove());
+            """)
             
-            # Click to focus
-            editor.click()
-            time.sleep(0.5)
+            # 2. Force Click: Use JS click to bypass 'ElementClickIntercepted' errors
+            try:
+                editor_element = self.driver.find_element(By.CLASS_NAME, "view-lines")
+                self.driver.execute_script("arguments[0].click();", editor_element)
+            except:
+                pass # Continue even if click fails, as we use direct injection below
             
-            # Select all and delete
-            editor.send_keys(Keys.CONTROL + "a")
-            time.sleep(0.2)
-            editor.send_keys(Keys.DELETE)
-            time.sleep(0.2)
+            # 3. Monaco Injection
+            safe_code = json.dumps(code)
+            js_code = f"monaco.editor.getModels()[0].setValue({safe_code});"
+            self.driver.execute_script(js_code)
             
-            # Type new code
-            editor.send_keys(code)
-            time.sleep(0.5)
+            time.sleep(1)
             
-            logger.info("Code injected successfully")
+            # 4. Click Run
+            buttons = self.driver.find_elements(By.TAG_NAME, "button")
+            for btn in buttons:
+                if "Run" in btn.text:
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    break
+        except Exception as e:
+            print(f"❌ Browser Injection Error (Handled): {e}")
+
+    def submit(self):
+        """Clicks Submit via JavaScript to ensure it isn't blocked"""
+        try:
+            buttons = self.driver.find_elements(By.TAG_NAME, "button")
+            for btn in buttons:
+                if "Submit" in btn.text:
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    return "Submitted"
+            return "Failed"
+        except:
+            return "Error"
+
+    def click_next(self):
+        """Navigates to the next problem"""
+        try:
+            # Try finding the right-chevron icon
+            next_btn = self.driver.find_element(By.XPATH, "//a[contains(@href, '/problems/') and .//*[contains(@data-icon, 'chevron-right')]]")
+            self.driver.execute_script("arguments[0].click();", next_btn)
             return True
-            
-        except Exception as e:
-            logger.error(f"Error injecting code: {e}")
-            return False
-    
-    def run_tests(self) -> None:
-        """Click 'Run' button to execute test cases
-        
-        Raises:
-            NoSuchElementException: If run button not found
-        """
-        try:
-            logger.info("Clicking Run button...")
-            
-            # Try multiple selectors for run button
-            selectors = SELECTORS["run_button"].split(", ")
-            
-            for selector in selectors:
-                try:
-                    wait = WebDriverWait(self.driver, 5)
-                    run_button = wait.until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector.strip()))
-                    )
-                    run_button.click()
-                    logger.info("Run button clicked")
-                    return
-                except (TimeoutException, NoSuchElementException):
-                    continue
-            
-            raise NoSuchElementException("Could not find Run button")
-            
-        except Exception as e:
-            logger.error(f"Error clicking Run button: {e}")
-            raise
-    
-    def get_test_result(self, timeout: int = 30) -> Dict:
-        """Poll for test result and parse outcome
-        
-        Args:
-            timeout: Maximum seconds to wait for result
-        
-        Returns:
-            dict: {
-                "status": "pass" | "fail" | "timeout",
-                "message": str,
-                "test_cases": list
-            }
-        """
-        logger.info(f"Waiting for test results (timeout: {timeout}s)...")
-        
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout:
+        except:
             try:
-                # Check for result container
-                result_element = self.driver.find_element(By.CSS_SELECTOR, SELECTORS["result_container"])
-                
-                if result_element and result_element.text:
-                    result_text = result_element.text.lower()
-                    
-                    # Check for success
-                    if "accepted" in result_text or "success" in result_text:
-                        logger.info("✓ Tests passed!")
-                        return {
-                            "status": "pass",
-                            "message": "All tests passed",
-                            "test_cases": []
-                        }
-                    
-                    # Check for failure
-                    if "wrong answer" in result_text or "error" in result_text or "fail" in result_text:
-                        logger.warning("✗ Tests failed")
-                        return {
-                            "status": "fail",
-                            "message": result_text,
-                            "test_cases": [result_text]
-                        }
-                
-            except (NoSuchElementException, StaleElementReferenceException):
-                pass
-            
-            # Poll interval
-            time.sleep(POLLING_INTERVALS["result_check"])
-        
-        # Timeout reached
-        logger.warning("Timeout waiting for test results")
-        return {
-            "status": "timeout",
-            "message": "Test execution timeout",
-            "test_cases": []
-        }
-    
-    def submit_solution(self) -> bool:
-        """Click 'Submit' button to finalize solution
-        
-        Returns:
-            bool: True if submission successful
-        """
-        try:
-            logger.info("Submitting solution...")
-            
-            # Try multiple selectors for submit button
-            selectors = SELECTORS["submit_button"].split(", ")
-            
-            for selector in selectors:
-                try:
-                    wait = WebDriverWait(self.driver, 5)
-                    submit_button = wait.until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector.strip()))
-                    )
-                    submit_button.click()
-                    logger.info("Submit button clicked")
-                    time.sleep(2)  # Wait for submission confirmation
-                    return True
-                except (TimeoutException, NoSuchElementException):
-                    continue
-            
-            logger.warning("Could not find Submit button")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error submitting solution: {e}")
-            return False
-    
-    def close(self):
-        """Close browser connection (do not quit Chrome process)"""
-        logger.info("Closing browser connection")
-        # Don't quit the browser, just disconnect
-        # self.driver.quit()  # Commented out to keep Chrome running
+                # Backup: Find by 'Next' text
+                next_btn = self.driver.find_element(By.XPATH, "//span[text()='Next']")
+                self.driver.execute_script("arguments[0].click();", next_btn)
+                return True
+            except:
+                return False
