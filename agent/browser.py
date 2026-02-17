@@ -1,110 +1,134 @@
 import json
 import time
-import re
+import logging
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+logger = logging.getLogger(__name__)
 
 class Browser:
     def __init__(self):
         opts = Options()
         opts.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+        opts.set_capability('goog:loggingPrefs', {'browser': 'ALL'})
         self.driver = webdriver.Chrome(options=opts)
 
     def get_current_slug(self):
-        """Extracts the problem name from the URL"""
         try:
             return self.driver.current_url.split("/problems/")[-1].split("/")[0]
         except:
             return "unknown-problem"
 
-    def optimize_tokens(self, text):
-        """
-        TOKEN OPTIMIZER: Strips unnecessary HTML and whitespace 
-        to maximize Gemini quota efficiency.
-        """
-        if not text: return ""
-        # Remove all HTML tags
-        clean_text = re.sub(r'<[^>]*>', '', text)
-        # Collapse multiple newlines/spaces into single spaces
-        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-        return clean_text
-
     def get_text(self):
-        """Scrapes and optimizes the problem description"""
+        """Scrapes problem description with AUTO-SCROLL."""
         try:
-            raw_text = self.driver.find_element(By.CSS_SELECTOR, "div[data-track-load='description_content']").text
-            return self.optimize_tokens(raw_text)
-        except:
-            try:
-                raw_text = self.driver.find_element(By.TAG_NAME, "body").text
-                return self.optimize_tokens(raw_text)
-            except:
-                return ""
+            # 1. Find the description container
+            selectors = ["div.elfjS", "div[data-track-load='description_content']", "div.question-content"]
+            target_elem = None
+            
+            for s in selectors:
+                try:
+                    target_elem = self.driver.find_element(By.CSS_SELECTOR, s)
+                    if target_elem: break
+                except: continue
+
+            if target_elem:
+                # 2. SCROLL IT (The Fix)
+                # We execute JS to scroll the element to the bottom to trigger lazy loading
+                self.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", target_elem)
+                time.sleep(0.5) # Wait for text to render
+                return target_elem.text
+            
+            # Fallback
+            return self.driver.find_element(By.TAG_NAME, "body").text[:2000]
+        except: return ""
 
     def get_starter_code(self):
-        """Scrapes the default code signature from the Monaco editor"""
         try:
             return self.driver.execute_script("return monaco.editor.getModels()[0].getValue();")
-        except:
-            return ""
+        except: return ""
 
     def run_code(self, code):
-        """Injects code safely using Force-Click and Banner-Removal logic"""
         try:
-            # 1. Pop-up & Banner Killer: Clears UI elements that intercept clicks
-            self.driver.execute_script("""
-                var blockers = document.querySelectorAll('.lc-md\\\\:h-8, [class*="overlay"], [class*="tooltip"], .guide-container');
-                blockers.forEach(el => el.remove());
-            """)
-            
-            # 2. Force Click: Use JS click to bypass 'ElementClickIntercepted' errors
-            try:
-                editor_element = self.driver.find_element(By.CLASS_NAME, "view-lines")
-                self.driver.execute_script("arguments[0].click();", editor_element)
-            except:
-                pass # Continue even if click fails, as we use direct injection below
-            
-            # 3. Monaco Injection
             safe_code = json.dumps(code)
-            js_code = f"monaco.editor.getModels()[0].setValue({safe_code});"
-            self.driver.execute_script(js_code)
-            
+            self.driver.execute_script(f"monaco.editor.getModels()[0].setValue({safe_code});")
             time.sleep(1)
             
-            # 4. Click Run
-            buttons = self.driver.find_elements(By.TAG_NAME, "button")
-            for btn in buttons:
-                if "Run" in btn.text:
+            xpath_selectors = [
+                "//button[contains(@data-e2e-locator, 'console-run-button')]",
+                "//div[@data-cy='run-code-btn']",
+                "//button[contains(text(), 'Run')]"
+            ]
+            for xpath in xpath_selectors:
+                try:
+                    btn = WebDriverWait(self.driver, 2).until(EC.element_to_be_clickable((By.XPATH, xpath)))
                     self.driver.execute_script("arguments[0].click();", btn)
-                    break
-        except Exception as e:
-            print(f"❌ Browser Injection Error (Handled): {e}")
+                    logger.info("▶️ Run button clicked.")
+                    return True
+                except: continue
+            return False
+        except: return False
+
+    def get_run_result(self):
+        try:
+            try:
+                WebDriverWait(self.driver, 20).until_not(
+                    EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Pending') or contains(text(), 'Running')]"))
+                )
+            except: pass
+
+            if self.driver.find_elements(By.XPATH, "//*[contains(@class, 'text-green') and contains(text(), 'Accepted')]"):
+                return "SUCCESS", "Passed"
+
+            # Check specific Error Types
+            error_keywords = ["Wrong Answer", "Runtime Error", "Compile Error", "Time Limit Exceeded", "Output Limit Exceeded"]
+            
+            for err in error_keywords:
+                if self.driver.find_elements(By.XPATH, f"//*[contains(@class, 'text-red') and contains(text(), '{err}')]"):
+                    # Try to get details
+                    try:
+                        details = self.driver.find_element(By.CSS_SELECTOR, "div.whitespace-pre-wrap").text
+                        return "FAILURE", f"{err}: {details[:500]}"
+                    except:
+                        return "FAILURE", err
+
+            return "UNKNOWN", "Unclear Result"
+        except:
+            return "TIMEOUT", "Timeout"
 
     def submit(self):
-        """Clicks Submit via JavaScript to ensure it isn't blocked"""
         try:
-            buttons = self.driver.find_elements(By.TAG_NAME, "button")
-            for btn in buttons:
-                if "Submit" in btn.text:
+            xpath_selectors = [
+                "//button[contains(@data-e2e-locator, 'console-submit-button')]",
+                "//div[@data-cy='submit-code-btn']"
+            ]
+            for xpath in xpath_selectors:
+                try:
+                    btn = WebDriverWait(self.driver, 2).until(EC.element_to_be_clickable((By.XPATH, xpath)))
                     self.driver.execute_script("arguments[0].click();", btn)
-                    return "Submitted"
-            return "Failed"
-        except:
-            return "Error"
+                    logger.info("🚀 Submit button clicked.")
+                    return True
+                except: continue
+            return False
+        except: return False
 
     def click_next(self):
-        """Navigates to the next problem"""
-        try:
-            # Try finding the right-chevron icon
-            next_btn = self.driver.find_element(By.XPATH, "//a[contains(@href, '/problems/') and .//*[contains(@data-icon, 'chevron-right')]]")
-            self.driver.execute_script("arguments[0].click();", next_btn)
-            return True
-        except:
+        selectors = [
+            "nav button[aria-label='Next Question']", 
+            "//a[contains(@href, '/problems/') and descendant::*[local-name()='svg' and contains(@data-icon, 'chevron-right')]]"
+        ]
+        for s in selectors:
             try:
-                # Backup: Find by 'Next' text
-                next_btn = self.driver.find_element(By.XPATH, "//span[text()='Next']")
-                self.driver.execute_script("arguments[0].click();", next_btn)
+                by = By.XPATH if s.startswith("//") else By.CSS_SELECTOR
+                btn = WebDriverWait(self.driver, 3).until(EC.element_to_be_clickable((by, s)))
+                self.driver.execute_script("arguments[0].click();", btn)
+                logger.info("➡️ Navigated to next problem.")
                 return True
-            except:
-                return False
+            except: continue
+        return False
+        
+    def refresh(self):
+        self.driver.refresh()
