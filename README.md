@@ -108,7 +108,7 @@ pip install selenium requests python-dotenv
 Create `.env`:
 
 ```
-BYTEZ_API_KEY=your_key_here
+OPENAI_API_KEY=your_key_here
 ```
 
 ## 4️⃣ Start the Agent
